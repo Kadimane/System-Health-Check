@@ -1,0 +1,110 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/health-system-api
+
+jobs:
+  # ── 1. Lint & Test ──────────────────────────────────────────────────────
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  # ── 2. Build & Push Docker image ────────────────────────────────────────
+  build-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: lint-test
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "sha_tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          # Tag with short SHA for traceability + latest for convenience
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE }}:latest
+
+  # ── 3. Manual approval gate before production ───────────────────────────
+  approve:
+    name: Await Production Approval
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: production          # GitHub Environment with required reviewers
+    steps:
+      - run: echo "Approved — deploying ${{ needs.build-push.outputs.image_tag }}"
+
+  # ── 4. Deploy to production ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-push, approve]
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            export IMAGE_TAG=${{ needs.build-push.outputs.image_tag }}
+            cd /opt/health-system
+            docker pull ${{ env.IMAGE }}:$IMAGE_TAG
+            docker compose up -d --no-deps app
+            echo $IMAGE_TAG > .last_deployed_tag
+
+  # ── 5. Rollback to previous image tag ───────────────────────────────────
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()                    # Auto-triggers if deploy job fails
+    steps:
+      - name: Rollback via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/health-system
+            PREV_TAG=$(cat .last_deployed_tag)
+            echo "Rolling back to $PREV_TAG"
+            docker pull ${{ env.IMAGE }}:$PREV_TAG
+            IMAGE_TAG=$PREV_TAG docker compose up -d --no-deps app

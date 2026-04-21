@@ -1,0 +1,40 @@
+groups:
+  - name: ussd_alerts
+    rules:
+
+      # 1. USSD session success rate drops below 95%
+      - alert: LowUSSDSessionSuccessRate
+        expr: |
+          (sum(rate(ussd_sessions_total{status="success"}[5m]))
+          / sum(rate(ussd_sessions_total[5m]))) * 100 < 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "USSD session success rate below 95%"
+          description: "Current rate: {{ $value | printf \"%.2f\" }}%"
+
+      # 2. Transaction response time p95 exceeds 3 seconds
+      - alert: HighTransactionLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(transaction_duration_seconds_bucket[5m])) by (le)
+          ) > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 transaction latency above 3s"
+          description: "p95 latency: {{ $value | printf \"%.2f\" }}s"
+
+      # 3. Failed payment rate exceeds 5%
+      - alert: HighFailedPaymentRate
+        expr: |
+          (sum(rate(payments_total{status="failed"}[5m]))
+          / sum(rate(payments_total[5m]))) * 100 > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Failed payment rate above 5%"
+          description: "Current failure rate: {{ $value | printf \"%.2f\" }}%"
